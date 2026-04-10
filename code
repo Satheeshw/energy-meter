@@ -1,0 +1,218 @@
+source myenv/bin/activate
+import spidev
+import time
+import numpy as np
+import pandas as pd
+from scipy.fft import rfft, rfftfreq
+from scipy.stats import skew, kurtosis
+import os
+
+from gpiozero import Button
+from RPLCD.i2c import CharLCD
+
+# ----------------------------
+# LCD + BUTTON SETUP
+# ----------------------------
+lcd = CharLCD('PCF8574', 0x27)
+button = Button(17, pull_up=True, bounce_time=0.2)
+
+mode = 0
+
+def change_mode():
+    global mode
+    mode = (mode + 1) % len(menu)
+
+button.when_pressed = change_mode
+
+# ----------------------------
+# USER INPUT
+# ----------------------------
+LABEL = input("Enter Appliance Name: ")
+
+# ----------------------------
+# SPI SETUP
+# ----------------------------
+spi = spidev.SpiDev()
+spi.open(0, 0)
+spi.max_speed_hz = 1350000
+
+VREF = 3.3
+SAMPLES = 2000
+FS = 2000
+
+# Calibration (adjust once)
+V_CAL = 455
+I_CAL = 30
+
+# ----------------------------
+# ADC READ
+# ----------------------------
+def read_adc(channel):
+    cmd = 0b110 | (channel >> 2)
+    cmd2 = (channel & 0x3) << 6
+    adc = spi.xfer2([cmd, cmd2, 0])
+    return ((adc[1] & 15) << 8) | adc[2]
+
+# ----------------------------
+# MAIN LOOP
+# ----------------------------
+try:
+    while True:
+
+        v_samples = []
+        i_samples = []
+
+        for _ in range(SAMPLES):
+            v = (read_adc(0) / 4095.0) * VREF
+            i = (read_adc(1) / 4095.0) * VREF
+
+            v_samples.append(v)
+            i_samples.append(i)
+
+            time.sleep(1 / FS)
+
+        v_samples = np.array(v_samples)
+        i_samples = np.array(i_samples)
+
+        # Offset removal
+        v_centered = v_samples - np.mean(v_samples)
+        i_centered = i_samples - np.mean(i_samples)
+
+        v_real = v_centered * V_CAL
+        i_real = i_centered * I_CAL
+
+        # Phase correction
+        corr = np.correlate(v_real, i_real, mode='full')
+        shift = corr.argmax() - len(v_real) + 1
+        i_aligned = np.roll(i_real, shift)
+
+        # RMS
+        Vrms = np.sqrt(np.mean(v_real**2))
+        Irms = np.sqrt(np.mean(i_aligned**2))
+
+        # Power
+        real_power = np.mean(v_real * i_aligned)
+        apparent_power = Vrms * Irms
+        pf = real_power / apparent_power if apparent_power != 0 else 0
+        pf = np.clip(pf, -1, 1)
+
+        phase_angle = np.arccos(pf)
+        P_norm = real_power / (Vrms**2 + 1e-6)
+
+        # Crest
+        crest_factor = np.max(np.abs(i_aligned)) / (Irms + 1e-6)
+
+        # FFT
+        yf = np.abs(rfft(i_aligned))
+        xf = rfftfreq(SAMPLES, 1 / FS)
+
+        fundamental_idx = np.argmax(yf[1:]) + 1
+        I_fundamental = yf[fundamental_idx]
+
+        def harmonic(freq):
+            idx = np.argmin(np.abs(xf - freq))
+            return yf[idx] / (I_fundamental + 1e-6)
+
+        I_H3 = harmonic(150)
+        I_H5 = harmonic(250)
+        I_H7 = harmonic(350)
+        I_H9 = harmonic(450)
+
+        I_THD = np.sqrt(I_H3**2 + I_H5**2 + I_H7**2 + I_H9**2)
+
+        Harmonic_Energy = I_THD / (I_fundamental + 1e-6)
+
+        # Extra features
+        ZCR = np.mean(np.diff(np.sign(i_aligned)) != 0)
+        I_peak_to_peak = np.max(i_aligned) - np.min(i_aligned)
+        Form_Factor = Irms / (np.mean(np.abs(i_aligned)) + 1e-6)
+
+        inst_power = v_real * i_aligned
+        Power_fluctuation = np.std(inst_power)
+
+        std_i = np.std(i_aligned)
+        skew_i = skew(i_aligned)
+        kurt_i = kurtosis(i_aligned)
+
+        # 🔥 NEW ML FEATURES
+        I_norm = Irms / (Vrms + 1e-6)
+        Peak_Factor = np.max(np.abs(i_aligned)) / (np.mean(np.abs(i_aligned)) + 1e-6)
+        Harmonic_Dominance = max(I_H3, I_H5, I_H7, I_H9)
+        Waveform_Energy = np.sum(i_aligned**2)
+
+        # ----------------------------
+        # MENU DISPLAY VALUES
+        # ----------------------------
+        menu = [
+            ("Voltage", f"{Vrms:.1f} V"),
+            ("Current", f"{Irms:.2f} A"),
+            ("PF", f"{pf:.2f}"),
+            ("THD", f"{I_THD:.3f}"),
+            ("Crest", f"{crest_factor:.2f}"),
+            ("ZCR", f"{ZCR:.2f}"),
+            ("FormF", f"{Form_Factor:.2f}"),
+            ("P_norm", f"{P_norm:.4f}")
+        ]
+
+        # LCD Display
+        lcd.clear()
+        title, value = menu[mode]
+        lcd.write_string(title)
+        lcd.crlf()
+        lcd.write_string(value)
+
+        # ----------------------------
+        # SAVE DATASET CSV
+        # ----------------------------
+        data = {
+            "Irms": Irms,
+            "Power_Factor": pf,
+            "Phase_Angle": phase_angle,
+            "P_norm": P_norm,
+            "Crest_Factor": crest_factor,
+            "I_THD": I_THD,
+            "I_H3_ratio": I_H3,
+            "I_H5_ratio": I_H5,
+            "I_H7_ratio": I_H7,
+            "I_H9_ratio": I_H9,
+            "I_fundamental": I_fundamental,
+            "Harmonic_Energy": Harmonic_Energy,
+            "ZCR": ZCR,
+            "I_peak_to_peak": I_peak_to_peak,
+            "Form_Factor": Form_Factor,
+            "Power_fluctuation": Power_fluctuation,
+            "Std_I": std_i,
+            "Skew_I": skew_i,
+            "Kurt_I": kurt_i,
+
+            # NEW
+            "I_norm": I_norm,
+            "Peak_Factor": Peak_Factor,
+            "Harmonic_Dominance": Harmonic_Dominance,
+            "Waveform_Energy": Waveform_Energy,
+
+            "Label": LABEL
+        }
+
+        df = pd.DataFrame([data])
+
+        file = "dataset.csv"
+        if not os.path.exists(file):
+            df.to_csv(file, index=False)
+        else:
+            df.to_csv(file, mode='a', header=False, index=False)
+
+        print(f"Saved: V={Vrms:.1f} I={Irms:.2f} PF={pf:.2f}")
+
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    lcd.clear()
+    lcd.write_string("Stopped")
+    spi.close()
+    print("Stopped safely")
+
+
+
+
+"python data_collect.py"
